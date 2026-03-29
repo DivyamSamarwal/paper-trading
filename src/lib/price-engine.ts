@@ -1,0 +1,318 @@
+import { getSQL, initDb } from './db';
+import { updateOptionPrices } from './greeks';
+import { generateNewsEvent } from './news';
+
+const VOLATILITY: Record<string, number> = {
+    EQUITY: 0.0008,
+    FUTURE: 0.0012,
+    COMMODITY: 0.001,
+    OPTION: 0,
+};
+
+export async function tickPrices() {
+    await initDb();
+    const sql = await getSQL();
+
+    try {
+        const symbols = await sql`SELECT * FROM symbols WHERE asset_type != 'OPTION'`;
+        const now = Math.floor(Date.now() / 1000);
+
+        // Batch: fetch ALL recent filled orders in one query instead of per-symbol
+        const cutoff = new Date(Date.now() - 60000).toISOString();
+        const allRecentOrders = await sql`
+            SELECT symbol_id, side, quantity FROM orders
+            WHERE status = 'FILLED' AND filled_at >= ${cutoff}
+        `;
+
+        // Pre-compute order flow per symbol in memory
+        const orderFlowMap: Record<string, { netBuy: number; totalVol: number }> = {};
+        for (const o of allRecentOrders) {
+            const key = o.symbol_id as string;
+            if (!orderFlowMap[key]) orderFlowMap[key] = { netBuy: 0, totalVol: 0 };
+            orderFlowMap[key].totalVol += Number(o.quantity);
+            orderFlowMap[key].netBuy += o.side === 'BUY' ? Number(o.quantity) : -Number(o.quantity);
+        }
+
+        for (const sym of symbols) {
+            const sigma = VOLATILITY[sym.asset_type] || 0.0008;
+            const price = Number(sym.current_price);
+            const randomChange = price * sigma * gaussianRandom();
+
+            const flow = orderFlowMap[sym.id as string];
+            const flowImpact = flow && flow.totalVol > 0
+                ? (flow.netBuy / flow.totalVol) * price * 0.0005 : 0;
+            const reversion = (Number(sym.base_price) - price) * 0.00005;
+
+            let newPrice = price + randomChange + flowImpact + reversion;
+            const upperCircuit = Number(sym.prev_close) * 1.10;
+            const lowerCircuit = Number(sym.prev_close) * 0.90;
+            newPrice = Math.max(lowerCircuit, Math.min(upperCircuit, newPrice));
+            newPrice = round2(Math.max(0.01, newPrice));
+
+            const open = price;
+            const close = newPrice;
+            const high = round2(Math.max(open, close) * (1 + Math.random() * 0.0003));
+            const low = round2(Math.min(open, close) * (1 - Math.random() * 0.0003));
+            const totalVolume = flow ? flow.totalVol : 0;
+            const volume = Math.floor(Math.random() * 500) + 50 + totalVolume;
+
+            const newDayHigh = Math.max(Number(sym.day_high), newPrice);
+            const newDayLow = Math.min(Number(sym.day_low), newPrice);
+            await sql`UPDATE symbols SET current_price = ${newPrice}, day_high = ${newDayHigh}, day_low = ${newDayLow} WHERE id = ${sym.id}`;
+            await sql`INSERT INTO price_history (symbol_id, timestamp, open, high, low, close, volume) VALUES (${sym.id}, ${now}, ${round2(open)}, ${high}, ${low}, ${round2(close)}, ${volume})`;
+        }
+
+        await updateOptionPrices();
+        await generateNewsEvent();
+        await matchPendingOrders();
+        await checkAutoLiquidation();
+
+        // Prune old price_history rows (keep last 10 minutes for snappy queries)
+        if (Math.random() < 0.02) {
+            const pruneTs = now - 600;
+            await sql`DELETE FROM price_history WHERE timestamp < ${pruneTs}`;
+        }
+
+        // Competition auto-start / auto-settle (~every 30 seconds)
+        if (Math.random() < 0.03) {
+            await manageCompetitions(sql);
+        }
+    } catch (e) {
+        console.error("Error in tickPrices:", e);
+    }
+}
+
+async function matchPendingOrders() {
+    const sql = await getSQL();
+    const pending = await sql`
+        SELECT o.*, s.current_price, s.asset_type, s.margin_req, s.lot_size
+        FROM orders o JOIN symbols s ON s.id = o.symbol_id
+        WHERE o.status = 'PENDING'
+    `;
+
+    for (const order of pending) {
+        let shouldFill = false;
+        if (order.order_type === 'MARKET') {
+            shouldFill = true;
+        } else if (order.order_type === 'LIMIT') {
+            if (order.side === 'BUY' && order.current_price <= order.price) shouldFill = true;
+            if (order.side === 'SELL' && order.current_price >= order.price) shouldFill = true;
+        } else if (order.order_type === 'STOP_LOSS') {
+            if (order.side === 'SELL' && order.current_price <= order.price) shouldFill = true;
+            if (order.side === 'BUY' && order.current_price >= order.price) shouldFill = true;
+        }
+        if (shouldFill) {
+            await executeOrderFill(order.id, order.user_id, order.symbol_id, order.side, order.quantity, order.current_price, order.asset_type, order.margin_req);
+        }
+    }
+}
+
+export async function executeOrderFill(
+    orderId: string, userId: string, symbolId: string,
+    side: string, quantity: number, currentPrice: number,
+    assetType: string, marginReq: number
+) {
+    const sql = await getSQL();
+    const { v4: genuuid } = await import('uuid');
+
+    const slippagePct = 0.0001 + Math.random() * 0.0009;
+    const slippageDir = side === 'BUY' ? 1 : -1;
+    const fillPrice = round2(currentPrice * (1 + slippagePct * slippageDir));
+    const commission = round2(1 + fillPrice * quantity * 0.001);
+    const totalCost = fillPrice * quantity;
+    const marginCost = assetType === 'FUTURE' ? totalCost * marginReq : totalCost;
+
+    const userRows = await sql`SELECT cash_balance FROM users WHERE id = ${userId}`;
+    if (userRows.length === 0) return;
+    const user = userRows[0];
+
+    if (side === 'BUY' && user.cash_balance < marginCost + commission) {
+        await sql`UPDATE orders SET status = 'REJECTED' WHERE id = ${orderId}`;
+        return;
+    }
+
+    // Update order
+    const nowIso = new Date().toISOString();
+    await sql`UPDATE orders SET status = 'FILLED', filled_price = ${fillPrice}, slippage = ${round2(slippagePct * 100)}, commission = ${commission}, filled_at = ${nowIso} WHERE id = ${orderId}`;
+
+    // Get existing position
+    const posRows = await sql`SELECT * FROM positions WHERE user_id = ${userId} AND symbol_id = ${symbolId}`;
+    const existingPos = posRows.length > 0 ? posRows[0] : null;
+
+    let realizedPnl = 0;
+    let isClosing = false;
+    let closedMargin = 0;
+
+    if (existingPos) {
+        const posSide = existingPos.side;
+        if ((side === 'BUY' && posSide === 'LONG') || (side === 'SELL' && posSide === 'SHORT')) {
+            const newQty = existingPos.quantity + quantity;
+            const newAvg = round2((existingPos.avg_price * existingPos.quantity + fillPrice * quantity) / newQty);
+            const newMargin = assetType === 'FUTURE' ? round2(newAvg * newQty * marginReq) : 0;
+            await sql`UPDATE positions SET quantity = ${newQty}, avg_price = ${newAvg}, margin_used = ${newMargin} WHERE id = ${existingPos.id}`;
+        } else {
+            isClosing = true;
+            closedMargin = existingPos.margin_used;
+            if (quantity >= existingPos.quantity) {
+                realizedPnl = posSide === 'LONG'
+                    ? (fillPrice - existingPos.avg_price) * existingPos.quantity
+                    : (existingPos.avg_price - fillPrice) * existingPos.quantity;
+                await sql`DELETE FROM positions WHERE id = ${existingPos.id}`;
+                if (quantity > existingPos.quantity) {
+                    const remaining = quantity - existingPos.quantity;
+                    const newSide = side === 'BUY' ? 'LONG' : 'SHORT';
+                    const newMargin = assetType === 'FUTURE' ? round2(fillPrice * remaining * marginReq) : 0;
+                    await sql`INSERT INTO positions (id, user_id, symbol_id, quantity, avg_price, side, margin_used) VALUES (${genuuid()}, ${userId}, ${symbolId}, ${remaining}, ${fillPrice}, ${newSide}, ${newMargin})`;
+                }
+            } else {
+                realizedPnl = posSide === 'LONG'
+                    ? (fillPrice - existingPos.avg_price) * quantity
+                    : (existingPos.avg_price - fillPrice) * quantity;
+                const newQty = existingPos.quantity - quantity;
+                const newMargin = assetType === 'FUTURE' ? round2(existingPos.avg_price * newQty * marginReq) : 0;
+                closedMargin = existingPos.margin_used - newMargin;
+                await sql`UPDATE positions SET quantity = ${newQty}, margin_used = ${newMargin} WHERE id = ${existingPos.id}`;
+            }
+        }
+    } else {
+        const posSide = side === 'BUY' ? 'LONG' : 'SHORT';
+        const margin = assetType === 'FUTURE' ? round2(fillPrice * quantity * marginReq) : 0;
+        await sql`INSERT INTO positions (id, user_id, symbol_id, quantity, avg_price, side, margin_used) VALUES (${genuuid()}, ${userId}, ${symbolId}, ${quantity}, ${fillPrice}, ${posSide}, ${margin})`;
+    }
+
+    realizedPnl = round2(realizedPnl);
+
+    // Update cash balance
+    if (isClosing) {
+        if (assetType === 'FUTURE') {
+            const credit = round2(closedMargin + realizedPnl - commission);
+            await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
+        } else {
+            const credit = round2(totalCost - commission);
+            await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
+        }
+    } else if (side === 'BUY') {
+        const deduction = round2(assetType === 'FUTURE' ? marginCost + commission : totalCost + commission);
+        await sql`UPDATE users SET cash_balance = cash_balance - ${deduction} WHERE id = ${userId}`;
+    } else {
+        if (assetType === 'FUTURE') {
+            await sql`UPDATE users SET cash_balance = cash_balance - ${round2(marginCost + commission)} WHERE id = ${userId}`;
+        } else {
+            const credit = round2(totalCost - commission);
+            await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
+        }
+    }
+
+    // Trade history
+    await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl) VALUES (${genuuid()}, ${userId}, ${symbolId}, ${side}, ${quantity}, ${fillPrice}, ${commission}, ${round2(slippagePct * 100)}, ${realizedPnl})`;
+
+    // Update volume & nudge price
+    await sql`UPDATE symbols SET volume_today = volume_today + ${quantity} WHERE id = ${symbolId}`;
+    const impact = side === 'BUY' ? quantity * 0.0001 : -quantity * 0.0001;
+    const newPrice = round2(Math.max(0.01, currentPrice * (1 + impact)));
+    const symRows = await sql`SELECT day_high, day_low FROM symbols WHERE id = ${symbolId}`;
+    if (symRows.length > 0) {
+        const newDayHigh = Math.max(Number(symRows[0].day_high), newPrice);
+        const newDayLow = Math.min(Number(symRows[0].day_low), newPrice);
+        await sql`UPDATE symbols SET current_price = ${newPrice}, day_high = ${newDayHigh}, day_low = ${newDayLow} WHERE id = ${symbolId}`;
+    }
+}
+
+async function checkAutoLiquidation() {
+    const sql = await getSQL();
+    const { v4: genuuid } = await import('uuid');
+
+    const futurePositions = await sql`
+        SELECT p.*, s.current_price, s.margin_req, u.cash_balance
+        FROM positions p
+        JOIN symbols s ON s.id = p.symbol_id
+        JOIN users u ON u.id = p.user_id
+        WHERE s.asset_type = 'FUTURE'
+    `;
+
+    for (const pos of futurePositions) {
+        const unrealizedPnl = pos.side === 'LONG'
+            ? (pos.current_price - pos.avg_price) * pos.quantity
+            : (pos.avg_price - pos.current_price) * pos.quantity;
+        const equity = pos.cash_balance + unrealizedPnl;
+        const marginUsed = pos.current_price * pos.quantity * pos.margin_req;
+
+        if (equity <= marginUsed * 0.1 || equity <= 0) {
+            const closeSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
+            const commission = round2(1 + pos.current_price * pos.quantity * 0.001);
+            await sql`DELETE FROM positions WHERE id = ${pos.id}`;
+            await sql`UPDATE users SET cash_balance = cash_balance + ${round2(unrealizedPnl - commission)} WHERE id = ${pos.user_id}`;
+            await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl) VALUES (${genuuid()}, ${pos.user_id}, ${pos.symbol_id}, ${closeSide + '_LIQUIDATION'}, ${pos.quantity}, ${pos.current_price}, ${commission}, ${0}, ${round2(unrealizedPnl)})`;
+        }
+    }
+}
+
+async function manageCompetitions(sql: Awaited<ReturnType<typeof getSQL>>) {
+    try {
+        const { v4: genuuid } = await import('uuid');
+        const nowIso = new Date().toISOString();
+
+        // Auto-settle expired ACTIVE competitions
+        const expiredComps = await sql`
+            SELECT id FROM competitions WHERE status = 'ACTIVE' AND end_time <= ${nowIso}
+        `;
+        for (const comp of expiredComps) {
+            // Compute final portfolio value for each participant
+            const entries = await sql`
+                SELECT ce.id, ce.user_id, ce.starting_balance, u.cash_balance
+                FROM competition_entries ce
+                JOIN users u ON u.id = ce.user_id
+                WHERE ce.competition_id = ${comp.id}
+            `;
+            const results: { id: string; finalBalance: number; profit: number }[] = [];
+            for (const entry of entries) {
+                const posVal = await sql`
+                    SELECT COALESCE(SUM(p.quantity * s.current_price), 0) as val
+                    FROM positions p JOIN symbols s ON s.id = p.symbol_id
+                    WHERE p.user_id = ${entry.user_id}
+                `;
+                const finalBalance = round2(Number(entry.cash_balance) + Number(posVal[0]?.val || 0));
+                const profit = round2(finalBalance - Number(entry.starting_balance));
+                results.push({ id: entry.id as string, finalBalance, profit });
+            }
+            // Rank by profit descending
+            results.sort((a, b) => b.profit - a.profit);
+            for (let i = 0; i < results.length; i++) {
+                const r = results[i];
+                await sql`UPDATE competition_entries SET final_balance = ${r.finalBalance}, profit = ${r.profit}, rank = ${i + 1} WHERE id = ${r.id}`;
+            }
+            await sql`UPDATE competitions SET status = 'SETTLED' WHERE id = ${comp.id}`;
+            console.log(`[Competition] Settled competition ${comp.id} with ${results.length} participants`);
+        }
+
+        // Auto-start: create a new daily competition if none is ACTIVE
+        const activeComps = await sql`SELECT id FROM competitions WHERE status = 'ACTIVE' LIMIT 1`;
+        if (activeComps.length === 0) {
+            const now = new Date();
+            // Start now, end at midnight UTC
+            const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+            // Count existing competitions for naming
+            const countRows = await sql`SELECT COUNT(*) as c FROM competitions`;
+            const compNumber = Number(countRows[0]?.c || 0) + 1;
+            const compId = genuuid();
+            await sql`
+                INSERT INTO competitions (id, name, status, start_time, end_time)
+                VALUES (${compId}, ${'Daily Challenge #' + compNumber}, 'ACTIVE', ${now.toISOString()}, ${endOfDay.toISOString()})
+            `;
+            console.log(`[Competition] Started Daily Challenge #${compNumber}, ends at ${endOfDay.toISOString()}`);
+        }
+    } catch (e) {
+        console.error('[Competition] Error managing competitions:', e);
+    }
+}
+
+function gaussianRandom(): number {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function round2(n: number): number {
+    return Math.round(n * 100) / 100;
+}
