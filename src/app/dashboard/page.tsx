@@ -498,7 +498,7 @@ function DashboardContent() {
                                             </div>
                                         ) : (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                                                {[...news].reverse().map(n => (
+                                                {[...news].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).map(n => (
                                                     <div key={n.id} style={{
                                                         padding: '4px 8px',
                                                         borderRadius: '4px',
