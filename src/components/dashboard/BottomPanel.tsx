@@ -56,6 +56,7 @@ export default function BottomPanel() {
                 </button>
             </div>
 
+
             {bottomTab === 'positions' && (
                 <div style={{ overflow: 'auto' }}>
                     {positions.length === 0 ? (

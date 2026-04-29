@@ -40,7 +40,7 @@ export default function OrderPanel() {
             const data = await res.json();
 
             if (res.ok) {
-                addToast(`${side} ${quantity} ${selected.ticker} — Order ${orderType === 'MARKET' ? 'filled' : 'placed'}!`, 'success');
+                addToast(`${side} ${quantity} ${selected.ticker} — Order submitted`, 'success');
                 // Portfolio will update via SSE/WS on next tick
             } else {
                 addToast(data.error || 'Order failed', 'error');

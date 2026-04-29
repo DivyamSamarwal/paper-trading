@@ -38,20 +38,38 @@ export async function GET(req: NextRequest) {
                 ORDER BY timestamp DESC LIMIT ${Math.min(limit, 2000)}
             `;
 
-            const T = Math.max(0, (new Date(sym.option_expiry as string).getTime() - Date.now()) / (365 * 86400000));
+            const expiryTime = new Date(sym.option_expiry as string).getTime();
 
             candles = rawCandles.map(c => {
-                const optOpen = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.open), Number(sym.option_strike), T, 0.05, Number(sym.iv));
-                const optHigh = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.high), Number(sym.option_strike), T, 0.05, Number(sym.iv));
-                const optLow = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.low), Number(sym.option_strike), T, 0.05, Number(sym.iv));
-                const optClose = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.close), Number(sym.option_strike), T, 0.05, Number(sym.iv));
+                const candleTime = Number(c.timestamp) * 1000;
+                const T = Math.max(0, (expiryTime - candleTime) / (365 * 86400000));
+                
+                const pOpen = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.open), Number(sym.option_strike), T, 0.05, Number(sym.iv));
+                const pHigh = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.high), Number(sym.option_strike), T, 0.05, Number(sym.iv));
+                const pLow = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.low), Number(sym.option_strike), T, 0.05, Number(sym.iv));
+                const pClose = blackScholesPrice(sym.option_type as 'CALL' | 'PUT', Number(c.close), Number(sym.option_strike), T, 0.05, Number(sym.iv));
+
+                const prices = [pOpen, pHigh, pLow, pClose];
+                let o = Math.round(pOpen * 100) / 100;
+                let h = Math.round(Math.max(...prices) * 100) / 100;
+                let l = Math.round(Math.min(...prices) * 100) / 100;
+                let cc = Math.round(pClose * 100) / 100;
+
+                // Ensure a minimum 0.01 spread for visibility if the underlying actually moved
+                if (h === l && c.high !== c.low) {
+                    h += 0.005;
+                    l -= 0.005;
+                    h = Math.round(h * 100) / 100;
+                    l = Math.round(l * 100) / 100;
+                    if (h === l) h += 0.01; // Force a gap if still flat
+                }
 
                 return {
                     timestamp: Number(c.timestamp),
-                    open: Math.round(Math.max(0.01, optOpen) * 100) / 100,
-                    high: Math.round(Math.max(0.01, optHigh) * 100) / 100,
-                    low: Math.round(Math.max(0.01, optLow) * 100) / 100,
-                    close: Math.round(Math.max(0.01, optClose) * 100) / 100,
+                    open: Math.max(0.01, o),
+                    high: Math.max(0.01, h),
+                    low: Math.max(0.01, l),
+                    close: Math.max(0.01, cc),
                     volume: 0
                 };
             });

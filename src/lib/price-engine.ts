@@ -15,9 +15,19 @@ const VOLATILITY: Record<string, number> = {
     OPTION: 0,
 };
 
+let lastResetTs = Date.now();
+const RESET_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
+
 export async function tickPrices() {
     await initDb();
     const sql = await getSQL();
+
+    // Perform Daily Reset (sync prev_close to current_price every 8h)
+    if (Date.now() - lastResetTs > RESET_INTERVAL) {
+        await sql`UPDATE symbols SET prev_close = current_price, day_open = current_price, day_high = current_price, day_low = current_price`;
+        lastResetTs = Date.now();
+        console.log('[Price Engine] Daily Reset Performed (Day metrics reset)');
+    }
 
     try {
         const symbols = await sql`SELECT * FROM symbols WHERE asset_type != 'OPTION'`;
@@ -154,8 +164,8 @@ export async function executeOrderFill(
     const sql = await getSQL();
     const { v4: genuuid } = await import('uuid');
 
-    // Progressive slippage: large orders suffer terrible execution prices
-    const sizePenalty = (quantity / 1000) * 0.005;
+    // Logarithmic slippage: realistic even for very large orders (max ~0.15%)
+    const sizePenalty = Math.log(1 + quantity / 500) * 0.00005;
     const slippagePct = 0.0001 + Math.random() * 0.0009 + sizePenalty;
     const slippageDir = side === 'BUY' ? 1 : -1;
     const fillPrice = round2(currentPrice * (1 + slippagePct * slippageDir));
@@ -167,7 +177,20 @@ export async function executeOrderFill(
     if (userRows.length === 0) return;
     const user = userRows[0];
 
-    if (side === 'BUY' && user.cash_balance < marginCost + commission) {
+    // Check if this is closing an existing position (exempt from balance check)
+    const posRows = await sql`SELECT * FROM positions WHERE user_id = ${userId} AND symbol_id = ${symbolId}`;
+    const existingPos = posRows.length > 0 ? posRows[0] : null;
+
+    let needsMarginCheck = false;
+    if (side === 'BUY') {
+        const isClosingShort = existingPos && existingPos.side === 'SHORT';
+        if (!isClosingShort || quantity > Number(existingPos.quantity)) needsMarginCheck = true;
+    } else { // SELL
+        const isClosingLong = existingPos && existingPos.side === 'LONG';
+        if (!isClosingLong || quantity > Number(existingPos.quantity)) needsMarginCheck = true;
+    }
+
+    if (needsMarginCheck && user.cash_balance < marginCost + commission) {
         await sql`UPDATE orders SET status = 'REJECTED' WHERE id = ${orderId}`;
         return;
     }
@@ -175,10 +198,6 @@ export async function executeOrderFill(
     // Update order
     const nowIso = new Date().toISOString();
     await sql`UPDATE orders SET status = 'FILLED', filled_price = ${fillPrice}, slippage = ${round2(slippagePct * 100)}, commission = ${commission}, filled_at = ${nowIso} WHERE id = ${orderId}`;
-
-    // Get existing position
-    const posRows = await sql`SELECT * FROM positions WHERE user_id = ${userId} AND symbol_id = ${symbolId}`;
-    const existingPos = posRows.length > 0 ? posRows[0] : null;
 
     let realizedPnl = 0;
     let isClosing = false;
@@ -265,27 +284,36 @@ async function checkAutoLiquidation() {
     const { v4: genuuid } = await import('uuid');
 
     const futurePositions = await sql`
-        SELECT p.*, s.current_price, s.margin_req, u.cash_balance
+        SELECT p.*, s.current_price, s.margin_req
         FROM positions p
         JOIN symbols s ON s.id = p.symbol_id
-        JOIN users u ON u.id = p.user_id
         WHERE s.asset_type = 'FUTURE'
     `;
 
     for (const pos of futurePositions) {
         const unrealizedPnl = pos.side === 'LONG'
-            ? (pos.current_price - pos.avg_price) * pos.quantity
-            : (pos.avg_price - pos.current_price) * pos.quantity;
-        const marginUsed = pos.current_price * pos.quantity * pos.margin_req;
-        // Include pos.margin_used (original posted margin) in equity calculation to prevent instant liquidation
-        const equity = pos.cash_balance + pos.margin_used + unrealizedPnl;
+            ? (Number(pos.current_price) - Number(pos.avg_price)) * Number(pos.quantity)
+            : (Number(pos.avg_price) - Number(pos.current_price)) * Number(pos.quantity);
 
-        if (equity <= marginUsed * 0.1 || equity <= 0) {
+        const postedMargin = Number(pos.margin_used);
+
+        // Liquidate only if the unrealized loss has consumed more than 80% of
+        // the originally posted margin for THIS position (maintenance margin breach).
+        // We deliberately DO NOT look at total cash_balance to avoid false liquidations
+        // caused by the user simply spending cash on other assets.
+        const remainingMargin = postedMargin + unrealizedPnl;
+        const maintenanceThreshold = postedMargin * 0.20; // 20% maintenance margin
+
+        if (remainingMargin <= maintenanceThreshold) {
             const closeSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
-            const commission = round2(1 + pos.current_price * pos.quantity * 0.001);
+            const commission = round2(1 + Number(pos.current_price) * Number(pos.quantity) * 0.001);
+            const cashCredit = round2(Math.max(0, remainingMargin) - commission);
             await sql`DELETE FROM positions WHERE id = ${pos.id}`;
-            await sql`UPDATE users SET cash_balance = cash_balance + ${round2(unrealizedPnl - commission)} WHERE id = ${pos.user_id}`;
-            await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl) VALUES (${genuuid()}, ${pos.user_id}, ${pos.symbol_id}, ${closeSide + '_LIQUIDATION'}, ${pos.quantity}, ${pos.current_price}, ${commission}, ${0}, ${round2(unrealizedPnl)})`;
+            // Credit back whatever margin is left (could be near 0) minus commission
+            await sql`UPDATE users SET cash_balance = cash_balance + ${cashCredit} WHERE id = ${pos.user_id}`;
+            await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl)
+                VALUES (${genuuid()}, ${pos.user_id}, ${pos.symbol_id}, ${closeSide + '_LIQUIDATION'}, ${Number(pos.quantity)}, ${Number(pos.current_price)}, ${commission}, ${0}, ${round2(unrealizedPnl)})`;
+            console.log(`[Liquidation] Position ${pos.id} liquidated. Remaining margin: ${remainingMargin.toFixed(2)}, Posted: ${postedMargin.toFixed(2)}`);
         }
     }
 }
@@ -337,21 +365,21 @@ async function manageCompetitions(sql: Awaited<ReturnType<typeof getSQL>>) {
             console.log(`[Competition] Settled competition ${comp.id} with ${results.length} participants`);
         }
 
-        // Auto-start: create a new daily competition if none is ACTIVE
+        // Auto-start: create a new competition if none is ACTIVE
         const activeComps = await sql`SELECT id FROM competitions WHERE status = 'ACTIVE' LIMIT 1`;
         if (activeComps.length === 0) {
             const now = new Date();
-            // Start now, end at midnight UTC
-            const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+            // Start now, end in 8 hours (matching the market cycle)
+            const endOffset = new Date(now.getTime() + 8 * 60 * 60 * 1000);
             // Count existing competitions for naming
             const countRows = await sql`SELECT COUNT(*) as c FROM competitions`;
             const compNumber = Number(countRows[0]?.c || 0) + 1;
             const compId = genuuid();
             await sql`
                 INSERT INTO competitions (id, name, status, start_time, end_time)
-                VALUES (${compId}, ${'Daily Challenge #' + compNumber}, 'ACTIVE', ${now.toISOString()}, ${endOfDay.toISOString()})
+                VALUES (${compId}, ${'Daily Challenge #' + compNumber}, 'ACTIVE', ${now.toISOString()}, ${endOffset.toISOString()})
             `;
-            console.log(`[Competition] Started Daily Challenge #${compNumber}, ends at ${endOfDay.toISOString()}`);
+            console.log(`[Competition] Started Challenge #${compNumber}, ends at ${endOffset.toISOString()}`);
         }
     } catch (e) {
         console.error('[Competition] Error managing competitions:', e);

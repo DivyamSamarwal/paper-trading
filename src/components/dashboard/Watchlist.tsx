@@ -38,7 +38,8 @@ export default function Watchlist() {
             </div>
             <div className="panel-body">
                 {filteredSymbols.map(s => {
-                    const chg = ((s.current_price - s.prev_close) / s.prev_close * 100);
+                    const dayChg = ((s.current_price - s.prev_close) / s.prev_close * 100);
+                    
                     return (
                         <div
                             key={s.id}
@@ -50,8 +51,8 @@ export default function Watchlist() {
                                 <div className="stock-name">{s.name}</div>
                             </div>
                             <div className="stock-price">${s.current_price.toFixed(2)}</div>
-                            <div className={`stock-change ${chg >= 0 ? 'positive' : chg < 0 ? 'negative' : 'neutral'}`}>
-                                {chg >= 0 ? '+' : ''}{chg.toFixed(2)}%
+                            <div className={`stock-change-badge ${dayChg >= 0 ? 'positive' : dayChg < 0 ? 'negative' : 'neutral'}`}>
+                                {dayChg >= 0 ? '+' : ''}{dayChg.toFixed(2)}%
                             </div>
                         </div>
                     );

@@ -5,6 +5,8 @@ import { WebSocketServer } from 'ws';
 import { getSQL } from './src/lib/db';
 import { ticker } from './src/lib/ticker';
 
+import { blackScholesPrice } from './src/lib/greeks';
+
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
 const port = parseInt(process.env.PORT || '3001', 10);
@@ -77,15 +79,37 @@ app.prepare().then(() => {
             for (const opt of options) {
                 const existing = candlesData.find(c => c.symbol_id === opt.id);
                 if (!existing) {
-                    candlesData.push({
-                        symbol_id: opt.id as string,
-                        timestamp: now,
-                        open: Number(opt.current_price),
-                        high: Number(opt.current_price),
-                        low: Number(opt.current_price),
-                        close: Number(opt.current_price),
-                        volume: 0,
-                    });
+                    const under = symbolsDb.find(s => s.ticker === opt.underlying);
+                    const underCandle = under ? candlesData.find(c => c.symbol_id === under.id) : null;
+                    
+                    if (underCandle) {
+                        const T = Math.max(0, (new Date(opt.option_expiry).getTime() - Date.now()) / (365 * 86400000));
+                        const pOpen = blackScholesPrice(opt.option_type as 'CALL' | 'PUT', underCandle.open, opt.option_strike, T, 0.05, opt.iv);
+                        const pHigh = blackScholesPrice(opt.option_type as 'CALL' | 'PUT', underCandle.high, opt.option_strike, T, 0.05, opt.iv);
+                        const pLow = blackScholesPrice(opt.option_type as 'CALL' | 'PUT', underCandle.low, opt.option_strike, T, 0.05, opt.iv);
+                        const pClose = blackScholesPrice(opt.option_type as 'CALL' | 'PUT', underCandle.close, opt.option_strike, T, 0.05, opt.iv);
+
+                        const prices = [pOpen, pHigh, pLow, pClose];
+                        candlesData.push({
+                            symbol_id: opt.id as string,
+                            timestamp: now,
+                            open: Math.max(0.01, Math.round(pOpen * 100) / 100),
+                            high: Math.max(0.01, Math.round(Math.max(...prices) * 100) / 100),
+                            low: Math.max(0.01, Math.round(Math.min(...prices) * 100) / 100),
+                            close: Math.max(0.01, Math.round(pClose * 100) / 100),
+                            volume: 0,
+                        });
+                    } else {
+                        candlesData.push({
+                            symbol_id: opt.id as string,
+                            timestamp: now,
+                            open: Number(opt.current_price),
+                            high: Number(opt.current_price),
+                            low: Number(opt.current_price),
+                            close: Number(opt.current_price),
+                            volume: 0,
+                        });
+                    }
                 }
             }
 

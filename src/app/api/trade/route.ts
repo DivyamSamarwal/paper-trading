@@ -46,20 +46,33 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: 'Price required for limit/stop-loss orders' }, { status: 400 });
         }
 
-        // Check balance for buy orders (skip if closing short)
+        // Check balance for new positions or increasing size (Closing existing positions is always allowed)
+        const posRows = await sql`SELECT side, quantity FROM positions WHERE user_id = ${session.user.id} AND symbol_id = ${symbolId}`;
+        const existingPos = posRows.length > 0 ? posRows[0] : null;
+        
+        let needsMarginCheck = false;
         if (side === 'BUY') {
-            const posRows = await sql`SELECT side, quantity FROM positions WHERE user_id = ${session.user.id} AND symbol_id = ${symbolId}`;
-            const existingPos = posRows.length > 0 ? posRows[0] : null;
-            const isClosingShort = existingPos && existingPos.side === 'SHORT' && quantity <= Number(existingPos.quantity);
+            const isClosingShort = existingPos && existingPos.side === 'SHORT';
+            if (!isClosingShort || qty > Number(existingPos.quantity)) needsMarginCheck = true;
+        } else { // SELL
+            const isClosingLong = existingPos && existingPos.side === 'LONG';
+            if (!isClosingLong || qty > Number(existingPos.quantity)) needsMarginCheck = true;
+        }
 
-            if (!isClosingShort) {
-                const userRows = await sql`SELECT cash_balance FROM users WHERE id = ${session.user.id}`;
-                if (userRows.length === 0) return NextResponse.json({ error: 'User not found' }, { status: 401 });
-                const cost = symbol.asset_type === 'FUTURE' ? symbolCurrentPrice * quantity * symbolMarginReq : symbolCurrentPrice * quantity;
-                const commission = 1 + cost * 0.001;
-                if (Number(userRows[0].cash_balance) < cost + commission) {
-                    return NextResponse.json({ error: 'Insufficient funds' }, { status: 400 });
-                }
+        if (needsMarginCheck) {
+            const userRows = await sql`SELECT cash_balance FROM users WHERE id = ${session.user.id}`;
+            if (userRows.length === 0) return NextResponse.json({ error: 'User not found' }, { status: 401 });
+            
+            // Include a 1% slippage buffer so the order won't get silently rejected during async fill
+            const slippageBuffer = 1.01;
+            const rawCost = symbol.asset_type === 'FUTURE'
+                ? symbolCurrentPrice * qty * symbolMarginReq
+                : symbolCurrentPrice * qty;
+            const cost = rawCost * slippageBuffer;
+            const commission = 1 + rawCost * 0.001;
+            
+            if (Number(userRows[0].cash_balance) < cost + commission) {
+                return NextResponse.json({ error: 'Insufficient funds' }, { status: 400 });
             }
         }
 

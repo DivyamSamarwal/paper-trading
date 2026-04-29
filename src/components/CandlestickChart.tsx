@@ -83,9 +83,29 @@ export default function CandlestickChart({ symbolId, ticker, latestCandles }: Pr
                 vertLine: { color: getVar('--chart-crosshair') || 'rgba(41,98,255,0.3)', labelBackgroundColor: getVar('--chart-label-bg') || '#1e222d' },
                 horzLine: { color: getVar('--chart-crosshair') || 'rgba(41,98,255,0.3)', labelBackgroundColor: getVar('--chart-label-bg') || '#1e222d' },
             },
-            timeScale: { timeVisible: true, secondsVisible: true, borderColor: getVar('--border') },
+            timeScale: {
+                timeVisible: true,
+                secondsVisible: true,
+                borderColor: getVar('--border'),
+                tickMarkFormatter: (time: number) => {
+                    const date = new Date(time * 1000);
+                    const h = date.getHours().toString().padStart(2, '0');
+                    const m = date.getMinutes().toString().padStart(2, '0');
+                    const s = date.getSeconds().toString().padStart(2, '0');
+                    return `${h}:${m}${s !== '00' ? ':' + s : ''}`;
+                },
+            },
             rightPriceScale: { borderColor: getVar('--border') },
             handleScroll: { vertTouchDrag: false },
+            localization: {
+                timeFormatter: (time: number) => {
+                    const date = new Date(time * 1000);
+                    return date.getHours().toString().padStart(2, '0') + ':' +
+                           date.getMinutes().toString().padStart(2, '0') + ':' +
+                           date.getSeconds().toString().padStart(2, '0');
+                },
+                priceFormatter: (price: number) => price.toFixed(2),
+            },
         });
 
         const cs = chart.addSeries(CandlestickSeries, {
