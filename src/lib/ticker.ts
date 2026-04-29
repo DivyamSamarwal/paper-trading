@@ -74,8 +74,12 @@ class Ticker {
 
 // Singleton — survives hot reloads in dev
 const globalTicker = globalThis as unknown as { __ticker?: Ticker };
-if (!globalTicker.__ticker) {
-    globalTicker.__ticker = new Ticker();
+
+// Force a clean restart of the ticker to pick up the patched price-engine logic
+if (globalTicker.__ticker) {
+    // We can't access private methods directly, but we can hack it to stop
+    (globalTicker.__ticker as any).stop();
 }
+globalTicker.__ticker = new Ticker();
 
 export const ticker = globalTicker.__ticker;

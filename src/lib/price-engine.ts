@@ -2,6 +2,12 @@ import { getSQL, initDb } from './db';
 import { updateOptionPrices } from './greeks';
 import { generateNewsEvent } from './news';
 
+interface ActiveMomentum {
+    forcePerTick: number;
+    remainingTicks: number;
+}
+const activeMomentum: Record<string, ActiveMomentum> = {};
+
 const VOLATILITY: Record<string, number> = {
     EQUITY: 0.0008,
     FUTURE: 0.0012,
@@ -18,7 +24,8 @@ export async function tickPrices() {
         const now = Math.floor(Date.now() / 1000);
 
         // Batch: fetch ALL recent filled orders in one query instead of per-symbol
-        const cutoff = new Date(Date.now() - 60000).toISOString();
+        // Cutoff is 2000ms to ensure orders are only counted for 1-2 ticks, preventing artificial 60s price ramping
+        const cutoff = new Date(Date.now() - 2000).toISOString();
         const allRecentOrders = await sql`
             SELECT symbol_id, side, quantity FROM orders
             WHERE status = 'FILLED' AND filled_at >= ${cutoff}
@@ -34,16 +41,31 @@ export async function tickPrices() {
         }
 
         for (const sym of symbols) {
-            const sigma = VOLATILITY[sym.asset_type] || 0.0008;
+            const ticker = sym.ticker as string;
+            const momentum = activeMomentum[ticker];
+            
+            // If active news momentum exists, triple the volatility
+            const sigma = (VOLATILITY[sym.asset_type] || 0.0008) * (momentum && momentum.remainingTicks > 0 ? 3 : 1);
             const price = Number(sym.current_price);
             const randomChange = price * sigma * gaussianRandom();
 
             const flow = orderFlowMap[sym.id as string];
-            const flowImpact = flow && flow.totalVol > 0
-                ? (flow.netBuy / flow.totalVol) * price * 0.0005 : 0;
+            // Use logarithmic dampening for order flow impact to prevent massive spikes
+            const dampenedVol = flow ? Math.log(1 + flow.totalVol) : 0;
+            const netRatio = flow && flow.totalVol > 0 ? (flow.netBuy / flow.totalVol) : 0;
+            const flowImpact = dampenedVol * netRatio * price * 0.0001;
             const reversion = (Number(sym.base_price) - price) * 0.00005;
 
-            let newPrice = price + randomChange + flowImpact + reversion;
+            let newsImpact = 0;
+            if (momentum && momentum.remainingTicks > 0) {
+                newsImpact = price * momentum.forcePerTick;
+                momentum.remainingTicks--;
+                if (momentum.remainingTicks <= 0) {
+                    delete activeMomentum[ticker];
+                }
+            }
+
+            let newPrice = price + randomChange + flowImpact + reversion + newsImpact;
             const upperCircuit = Number(sym.prev_close) * 1.10;
             const lowerCircuit = Number(sym.prev_close) * 0.90;
             newPrice = Math.max(lowerCircuit, Math.min(upperCircuit, newPrice));
@@ -54,7 +76,9 @@ export async function tickPrices() {
             const high = round2(Math.max(open, close) * (1 + Math.random() * 0.0003));
             const low = round2(Math.min(open, close) * (1 - Math.random() * 0.0003));
             const totalVolume = flow ? flow.totalVol : 0;
-            const volume = Math.floor(Math.random() * 500) + 50 + totalVolume;
+            // Inject massive random volume if there's active news momentum
+            const newsVolume = (newsImpact !== 0) ? Math.floor(Math.random() * 5000) + 2000 : 0;
+            const volume = Math.floor(Math.random() * 500) + 50 + totalVolume + newsVolume;
 
             const newDayHigh = Math.max(Number(sym.day_high), newPrice);
             const newDayLow = Math.min(Number(sym.day_low), newPrice);
@@ -63,7 +87,22 @@ export async function tickPrices() {
         }
 
         await updateOptionPrices();
-        await generateNewsEvent();
+        
+        const newsEvent = await generateNewsEvent();
+        if (newsEvent) {
+            // Apply momentum for 30 ticks (30 seconds)
+            const duration = 30;
+            // The news event returns impact in percentage (e.g. 3.5 means 3.5%)
+            // We need to divide by 100 to get decimal, and by duration to get force per tick
+            const forcePerTick = (newsEvent.impact / 100) / duration;
+            for (const ticker of newsEvent.affectedTickers) {
+                activeMomentum[ticker] = {
+                    forcePerTick,
+                    remainingTicks: duration
+                };
+            }
+        }
+        
         await matchPendingOrders();
         await checkAutoLiquidation();
 
@@ -115,7 +154,9 @@ export async function executeOrderFill(
     const sql = await getSQL();
     const { v4: genuuid } = await import('uuid');
 
-    const slippagePct = 0.0001 + Math.random() * 0.0009;
+    // Progressive slippage: large orders suffer terrible execution prices
+    const sizePenalty = (quantity / 1000) * 0.005;
+    const slippagePct = 0.0001 + Math.random() * 0.0009 + sizePenalty;
     const slippageDir = side === 'BUY' ? 1 : -1;
     const fillPrice = round2(currentPrice * (1 + slippagePct * slippageDir));
     const commission = round2(1 + fillPrice * quantity * 0.001);
@@ -183,20 +224,18 @@ export async function executeOrderFill(
     realizedPnl = round2(realizedPnl);
 
     // Update cash balance
-    if (isClosing) {
-        if (assetType === 'FUTURE') {
+    if (assetType === 'FUTURE') {
+        if (isClosing) {
             const credit = round2(closedMargin + realizedPnl - commission);
             await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
         } else {
-            const credit = round2(totalCost - commission);
-            await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
-        }
-    } else if (side === 'BUY') {
-        const deduction = round2(assetType === 'FUTURE' ? marginCost + commission : totalCost + commission);
-        await sql`UPDATE users SET cash_balance = cash_balance - ${deduction} WHERE id = ${userId}`;
-    } else {
-        if (assetType === 'FUTURE') {
             await sql`UPDATE users SET cash_balance = cash_balance - ${round2(marginCost + commission)} WHERE id = ${userId}`;
+        }
+    } else {
+        // Equity / Spot: simplify cash flow strictly based on transaction side
+        if (side === 'BUY') {
+            const deduction = round2(totalCost + commission);
+            await sql`UPDATE users SET cash_balance = cash_balance - ${deduction} WHERE id = ${userId}`;
         } else {
             const credit = round2(totalCost - commission);
             await sql`UPDATE users SET cash_balance = cash_balance + ${credit} WHERE id = ${userId}`;
@@ -206,9 +245,12 @@ export async function executeOrderFill(
     // Trade history
     await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl) VALUES (${genuuid()}, ${userId}, ${symbolId}, ${side}, ${quantity}, ${fillPrice}, ${commission}, ${round2(slippagePct * 100)}, ${realizedPnl})`;
 
-    // Update volume & nudge price
+    // Update volume & nudge price with logarithmic dampening
     await sql`UPDATE symbols SET volume_today = volume_today + ${quantity} WHERE id = ${symbolId}`;
-    const impact = side === 'BUY' ? quantity * 0.0001 : -quantity * 0.0001;
+    const dampenedQty = Math.log(1 + quantity);
+    let impact = side === 'BUY' ? dampenedQty * 0.0005 : -dampenedQty * 0.0005;
+    // Cap immediate price impact to 0.5% max per trade
+    impact = Math.max(-0.005, Math.min(0.005, impact));
     const newPrice = round2(Math.max(0.01, currentPrice * (1 + impact)));
     const symRows = await sql`SELECT day_high, day_low FROM symbols WHERE id = ${symbolId}`;
     if (symRows.length > 0) {
@@ -234,8 +276,9 @@ async function checkAutoLiquidation() {
         const unrealizedPnl = pos.side === 'LONG'
             ? (pos.current_price - pos.avg_price) * pos.quantity
             : (pos.avg_price - pos.current_price) * pos.quantity;
-        const equity = pos.cash_balance + unrealizedPnl;
         const marginUsed = pos.current_price * pos.quantity * pos.margin_req;
+        // Include pos.margin_used (original posted margin) in equity calculation to prevent instant liquidation
+        const equity = pos.cash_balance + pos.margin_used + unrealizedPnl;
 
         if (equity <= marginUsed * 0.1 || equity <= 0) {
             const closeSide = pos.side === 'LONG' ? 'SELL' : 'BUY';
@@ -267,7 +310,16 @@ async function manageCompetitions(sql: Awaited<ReturnType<typeof getSQL>>) {
             const results: { id: string; finalBalance: number; profit: number }[] = [];
             for (const entry of entries) {
                 const posVal = await sql`
-                    SELECT COALESCE(SUM(p.quantity * s.current_price), 0) as val
+                    SELECT COALESCE(SUM(
+                        CASE 
+                            WHEN s.asset_type = 'FUTURE' THEN
+                                p.margin_used + 
+                                (CASE WHEN p.side = 'LONG' THEN (s.current_price - p.avg_price) * p.quantity ELSE (p.avg_price - s.current_price) * p.quantity END)
+                            WHEN p.side = 'LONG' THEN p.quantity * s.current_price
+                            WHEN p.side = 'SHORT' THEN -p.quantity * s.current_price
+                            ELSE 0
+                        END
+                    ), 0) as val
                     FROM positions p JOIN symbols s ON s.id = p.symbol_id
                     WHERE p.user_id = ${entry.user_id}
                 `;

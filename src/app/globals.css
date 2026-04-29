@@ -584,6 +584,14 @@ a:hover {
   height: 100%;
 }
 
+/* Hide TradingView Lightweight Charts Watermark */
+.chart-container a, 
+.chart-container iframe {
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
 /* ═══ ORDER PANEL ═══ */
 .order-panel {
   background: var(--bg-secondary);
