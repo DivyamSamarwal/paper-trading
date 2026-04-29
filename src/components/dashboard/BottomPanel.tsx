@@ -151,33 +151,41 @@ export default function BottomPanel() {
             )}
 
             {bottomTab === 'news' && (
-                <div style={{ overflow: 'auto', maxHeight: '200px', padding: '4px 8px' }}>
+                <div style={{ overflow: 'auto', flex: 1 }}>
                     {news.length === 0 ? (
                         <div className="empty-state">
                             <div className="empty-icon">—</div>
                             <div className="empty-text">No news yet</div>
                         </div>
                     ) : (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                            {[...news].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).map(n => (
-                                <div key={n.id} style={{
-                                    padding: '4px 8px',
-                                    borderRadius: '4px',
-                                    background: n.impact > 0 ? 'rgba(0,255,136,0.04)' : n.impact < 0 ? 'rgba(255,51,102,0.04)' : 'transparent',
-                                    borderLeft: `2px solid ${n.impact > 0 ? 'var(--green-text)' : n.impact < 0 ? 'var(--red-text)' : 'var(--border)'}`,
-                                    fontSize: '11px',
-                                    display: 'flex',
-                                    justifyContent: 'space-between',
-                                    alignItems: 'center',
-                                    gap: '8px',
-                                }}>
-                                    <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{n.headline}</span>
-                                    <span className={n.impact >= 0 ? 'pnl-positive' : 'pnl-negative'} style={{ fontSize: '10px', flexShrink: 0 }}>
-                                        {n.impact >= 0 ? '+' : ''}{n.impact.toFixed(1)}%
-                                    </span>
-                                    <span style={{ fontSize: '10px', color: 'var(--text-muted)', flexShrink: 0 }}>{new Date(n.timestamp).toLocaleTimeString()}</span>
-                                </div>
-                            ))}
+                        <div className="news-feed-container">
+                            {[...news].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).map(n => {
+                                const formattedHeadline = n.headline.replace(/^\*/, '').trim();
+                                // Optional: simple heuristic to convert ALL CAPS to Title Case
+                                const displayHeadline = formattedHeadline === formattedHeadline.toUpperCase()
+                                    ? formattedHeadline.toLowerCase().split(' ').map(w => w.length > 1 ? w[0].toUpperCase() + w.slice(1) : w).join(' ')
+                                    : formattedHeadline;
+
+                                return (
+                                    <div key={n.id} className={`news-item ${n.impact > 0 ? 'impact-pos' : n.impact < 0 ? 'impact-neg' : ''}`}>
+                                        <div className="news-header">
+                                            <span className="news-time">
+                                                {new Date(n.timestamp.includes(' ') && !n.timestamp.includes('Z') ? n.timestamp.replace(' ', 'T') + 'Z' : n.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
+                                            </span>
+                                            <span className={`news-impact-badge ${n.impact > 0 ? 'pos' : n.impact < 0 ? 'neg' : 'neutral'}`}>
+                                                {n.impact > 0 ? 'Bullish' : n.impact < 0 ? 'Bearish' : 'Neutral'} · {n.impact > 0 ? '+' : ''}{n.impact.toFixed(1)}%
+                                            </span>
+                                        </div>
+                                        <div className="news-headline">{displayHeadline}</div>
+                                        <div className="news-footer">
+                                            <span className="news-type-tag">{n.type}</span>
+                                            {n.affectedTickers?.map(ticker => (
+                                                <span key={ticker} className="news-ticker-tag">{ticker}</span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
                         </div>
                     )}
                 </div>
