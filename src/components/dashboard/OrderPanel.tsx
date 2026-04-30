@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useTradingStore } from '@/store/tradingStore';
 import { useToast } from '@/components/Toast';
 
@@ -10,15 +11,18 @@ export default function OrderPanel() {
         setSide, setOrderType, setQuantity, setLimitPrice, setOrderLoading 
     } = useTradingStore();
 
+    const [cooldown, setCooldown] = useState(0);
+
     if (!selected) return null;
 
     const estimatedCost = parseFloat(quantity || '0') * selected.current_price;
     const estimatedCommission = 1 + estimatedCost * 0.001;
     const marginCost = selected.asset_type === 'FUTURE' ? estimatedCost * selected.margin_req : estimatedCost;
-
+ 
     const handleTrade = async () => {
+        if (cooldown > 0) return;
         setOrderLoading(true);
-
+ 
         try {
             const body: Record<string, unknown> = {
                 symbolId: selected.id,
@@ -26,22 +30,29 @@ export default function OrderPanel() {
                 orderType,
                 quantity: parseInt(quantity),
             };
-
+ 
             if (orderType !== 'MARKET') {
                 body.price = parseFloat(limitPrice);
             }
-
+ 
             const res = await fetch('/api/trade', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
-
+ 
             const data = await res.json();
-
+ 
             if (res.ok) {
                 addToast(`${side} ${quantity} ${selected.ticker} — Order submitted`, 'success');
-                // Portfolio will update via SSE/WS on next tick
+                // Start UI cooldown
+                setCooldown(3);
+                const timer = setInterval(() => {
+                    setCooldown(prev => {
+                        if (prev <= 1) { clearInterval(timer); return 0; }
+                        return prev - 1;
+                    });
+                }, 1000);
             } else {
                 addToast(data.error || 'Order failed', 'error');
             }
@@ -142,9 +153,9 @@ export default function OrderPanel() {
                 <button
                     className={`btn-place-order ${side.toLowerCase()}`}
                     onClick={handleTrade}
-                    disabled={orderLoading || !quantity || parseInt(quantity) <= 0}
+                    disabled={orderLoading || cooldown > 0 || !quantity || parseInt(quantity) <= 0}
                 >
-                    {orderLoading ? 'Executing...' : `${side} ${selected.ticker}`}
+                    {orderLoading ? 'Executing...' : cooldown > 0 ? `Wait ${cooldown}s` : `${side} ${selected.ticker}`}
                 </button>
             </div>
         </div>

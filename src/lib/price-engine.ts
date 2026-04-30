@@ -15,18 +15,22 @@ const VOLATILITY: Record<string, number> = {
     OPTION: 0,
 };
 
-let lastResetTs = Date.now();
 const RESET_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
 
 export async function tickPrices() {
     await initDb();
     const sql = await getSQL();
 
-    // Perform Daily Reset (sync prev_close to current_price every 8h)
-    if (Date.now() - lastResetTs > RESET_INTERVAL) {
+    // Perform Persistent Daily Reset (sync metrics every 8h clock cycle)
+    const currentSessionIdx = Math.floor(Date.now() / RESET_INTERVAL).toString();
+    const lastResetRows = await sql`SELECT val FROM settings WHERE key = 'last_market_reset'`;
+    const lastSessionIdx = lastResetRows[0]?.val;
+
+    if (lastSessionIdx !== currentSessionIdx) {
         await sql`UPDATE symbols SET prev_close = current_price, day_open = current_price, day_high = current_price, day_low = current_price`;
-        lastResetTs = Date.now();
-        console.log('[Price Engine] Daily Reset Performed (Day metrics reset)');
+        await sql`INSERT INTO settings (key, val) VALUES ('last_market_reset', ${currentSessionIdx}) 
+                  ON CONFLICT(key) DO UPDATE SET val = excluded.val`;
+        console.log(`[Price Engine] Daily Reset Performed for Session ${currentSessionIdx}`);
     }
 
     try {
@@ -266,11 +270,11 @@ export async function executeOrderFill(
 
     // Update volume & nudge price with logarithmic dampening
     await sql`UPDATE symbols SET volume_today = volume_today + ${quantity} WHERE id = ${symbolId}`;
-    const dampenedQty = Math.log(1 + quantity);
-    let impact = side === 'BUY' ? dampenedQty * 0.0005 : -dampenedQty * 0.0005;
-    // Cap immediate price impact to 0.5% max per trade
-    impact = Math.max(-0.005, Math.min(0.005, impact));
-    const newPrice = round2(Math.max(0.01, currentPrice * (1 + impact)));
+    // Linear impact: 0.01% per 100 shares (much more realistic than log)
+    const impact = side === 'BUY' ? quantity * 0.000001 : -quantity * 0.000001;
+    // Cap immediate price impact to 0.5% max per trade to prevent massive spikes
+    const cappedImpact = Math.max(-0.005, Math.min(0.005, impact));
+    const newPrice = round2(Math.max(0.01, currentPrice * (1 + cappedImpact)));
     const symRows = await sql`SELECT day_high, day_low FROM symbols WHERE id = ${symbolId}`;
     if (symRows.length > 0) {
         const newDayHigh = Math.max(Number(symRows[0].day_high), newPrice);

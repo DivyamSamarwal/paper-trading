@@ -223,6 +223,13 @@ export async function initDb() {
 
   await sql`CREATE INDEX IF NOT EXISTS idx_ce_comp ON competition_entries(competition_id)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_ce_user ON competition_entries(user_id)`;
+  
+  await sql`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      val TEXT NOT NULL
+    )
+  `;
 
   // Seed if empty
   const result = await sql`SELECT COUNT(*) as c FROM symbols`;

@@ -4,12 +4,25 @@ import { getSQL, initDb } from '@/lib/db';
 import { executeOrderFill } from '@/lib/price-engine';
 import { v4 as uuid } from 'uuid';
 
+// In-memory cooldown tracker
+const userCooldowns = new Map<string, number>();
+const COOLDOWN_MS = 3000;
+
 export async function POST(req: NextRequest) {
     try {
         const session = await auth();
         if (!session?.user?.id) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
+
+        // Rate Limit check
+        const now = Date.now();
+        const lastTrade = userCooldowns.get(session.user.id) || 0;
+        if (now - lastTrade < COOLDOWN_MS) {
+            const wait = Math.ceil((COOLDOWN_MS - (now - lastTrade)) / 1000);
+            return NextResponse.json({ error: `Please wait ${wait}s between trades` }, { status: 429 });
+        }
+        userCooldowns.set(session.user.id, now);
 
         const { symbolId, side, orderType, quantity, price } = await req.json();
         if (!symbolId || !side || !orderType || !quantity) {
