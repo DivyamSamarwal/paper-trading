@@ -319,33 +319,7 @@ async function seedMarket(sql: SqlFn) {
     }
   }
 
-  const topEquities = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'META'];
-  for (const ticker of topEquities) {
-    const eqRows = await sql`SELECT id, current_price FROM symbols WHERE ticker = ${ticker}`;
-    if (eqRows.length === 0) continue;
-    const basePrice = Number(eqRows[0].current_price);
-
-    for (const expDays of [7, 14, 30]) {
-      const expiry = new Date(Date.now() + expDays * 86400000).toISOString();
-      const strikes = [
-        Math.round(basePrice * 0.9), Math.round(basePrice * 0.95),
-        Math.round(basePrice), Math.round(basePrice * 1.05), Math.round(basePrice * 1.1),
-      ];
-
-      for (const strike of strikes) {
-        for (const optType of ['CALL', 'PUT'] as const) {
-          const T = expDays / 365;
-          const intrinsic = optType === 'CALL' ? Math.max(0, basePrice - strike) : Math.max(0, strike - basePrice);
-          const timeValue = basePrice * 0.3 * Math.sqrt(T) * 0.4;
-          const premium = round2(intrinsic + timeValue);
-          const optTicker = `${ticker}_${strike}${optType[0]}_${expDays}D`;
-          const optName = `${ticker} $${strike} ${optType} ${expDays}D`;
-          await sql`INSERT OR IGNORE INTO symbols (id, ticker, name, asset_type, base_price, current_price, prev_close, day_open, day_high, day_low, lot_size, margin_req, underlying, option_type, option_strike, option_expiry, iv)
-            VALUES (${genuuid()}, ${optTicker}, ${optName}, 'OPTION', ${premium}, ${premium}, ${premium}, ${premium}, ${premium}, ${premium}, 100, 1.0, ${ticker}, ${optType}, ${strike}, ${expiry}, 0.3)`;
-        }
-      }
-    }
-  }
+  // Options are now handled dynamically by the Price Engine during its initial tick.
 }
 
 function round2(n: number): number {

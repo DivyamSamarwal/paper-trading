@@ -1,5 +1,5 @@
 import { getSQL, initDb } from './db';
-import { updateOptionPrices } from './greeks';
+import { updateOptionPrices, blackScholesPrice } from './greeks';
 import { generateNewsEvent } from './news';
 
 interface ActiveMomentum {
@@ -30,7 +30,26 @@ export async function tickPrices() {
         await sql`UPDATE symbols SET prev_close = current_price, day_open = current_price, day_high = current_price, day_low = current_price`;
         await sql`INSERT INTO settings (key, val) VALUES ('last_market_reset', ${currentSessionIdx}) 
                   ON CONFLICT(key) DO UPDATE SET val = excluded.val`;
+        
         console.log(`[Price Engine] Daily Reset Performed for Session ${currentSessionIdx}`);
+
+        // 1. Settle Expired Options (Intrinsic value payout)
+        await settleExpiredOptions();
+
+        // 2. Generate New Option Chain
+        const underlyings = await sql`SELECT ticker, current_price FROM symbols WHERE asset_type = 'EQUITY'`;
+        for (const u of underlyings) {
+            await generateOptionChain(u.ticker, Number(u.current_price));
+        }
+    }
+
+    // Ensure initial options exist
+    const optCount = await sql`SELECT COUNT(*) as c FROM symbols WHERE asset_type = 'OPTION'`;
+    if (Number(optCount[0]?.c || 0) === 0) {
+        const underlyings = await sql`SELECT ticker, current_price FROM symbols WHERE asset_type = 'EQUITY'`;
+        for (const u of underlyings) {
+            await generateOptionChain(u.ticker, Number(u.current_price));
+        }
     }
 
     try {
@@ -387,6 +406,82 @@ async function manageCompetitions(sql: Awaited<ReturnType<typeof getSQL>>) {
         }
     } catch (e) {
         console.error('[Competition] Error managing competitions:', e);
+    }
+}
+
+async function settleExpiredOptions() {
+    const sql = await getSQL();
+    const { v4: genuuid } = await import('uuid');
+    const nowIso = new Date().toISOString();
+
+    const expired = await sql`
+        SELECT s.id, s.ticker, s.underlying, s.option_type, s.option_strike, u.current_price as underlying_price
+        FROM symbols s
+        JOIN symbols u ON u.ticker = s.underlying
+        WHERE s.asset_type = 'OPTION' AND s.option_expiry <= ${nowIso}
+    `;
+
+    for (const opt of expired) {
+        const positions = await sql`SELECT * FROM positions WHERE symbol_id = ${opt.id}`;
+        for (const pos of positions) {
+            const S = Number(opt.underlying_price);
+            const K = Number(opt.option_strike);
+            const qty = Number(pos.quantity);
+            
+            let intrinsic = 0;
+            if (opt.option_type === 'CALL') intrinsic = Math.max(0, S - K);
+            else intrinsic = Math.max(0, K - S);
+
+            const payout = round2(intrinsic * qty);
+            const realizedPnl = round2(payout - (Number(pos.avg_price) * qty));
+
+            await sql`DELETE FROM positions WHERE id = ${pos.id}`;
+            await sql`UPDATE users SET cash_balance = cash_balance + ${payout} WHERE id = ${pos.user_id}`;
+            await sql`INSERT INTO trade_history (id, user_id, symbol_id, side, quantity, price, commission, slippage, realized_pnl)
+                      VALUES (${genuuid()}, ${pos.user_id}, ${opt.id}, 'SETTLEMENT', ${qty}, ${S}, 0, 0, ${realizedPnl})`;
+            
+            console.log(`[Option Settlement] Settled ${opt.ticker} for ${pos.user_id}. Payout: $${payout}, PnL: $${realizedPnl}`);
+        }
+        await sql`DELETE FROM symbols WHERE id = ${opt.id}`;
+    }
+}
+
+export async function generateOptionChain(underlying: string, currentPrice: number) {
+    const sql = await getSQL();
+    const { v4: genuuid } = await import('uuid');
+
+    const strikes = [
+        Math.round(currentPrice * 0.95),
+        Math.round(currentPrice),
+        Math.round(currentPrice * 1.05)
+    ];
+    
+    const expiries = [
+        { label: '7D', days: 7 },
+        { label: '14D', days: 14 },
+        { label: '30D', days: 30 }
+    ];
+
+    for (const K of strikes) {
+        for (const exp of expiries) {
+            const expiryDate = new Date(Date.now() + exp.days * 86400000);
+            const T = exp.days / 365;
+            
+            for (const type of ['CALL', 'PUT']) {
+                const ticker = `${underlying}_${K}${type === 'CALL' ? 'C' : 'P'}_${exp.label}`;
+                const name = `${underlying} $${K} ${type} ${exp.label}`;
+                const id = genuuid();
+
+                // Calculate initial price to prevent % change spikes
+                const initialPrice = round2(Math.max(0.01, blackScholesPrice(type as 'CALL' | 'PUT', currentPrice, K, T, 0.05, 0.3)));
+
+                await sql`
+                    INSERT INTO symbols (id, ticker, name, asset_type, current_price, base_price, prev_close, day_open, day_high, day_low, underlying, option_type, option_strike, option_expiry, iv)
+                    VALUES (${id}, ${ticker}, ${name}, 'OPTION', ${initialPrice}, ${initialPrice}, ${initialPrice}, ${initialPrice}, ${initialPrice}, ${initialPrice}, ${underlying}, ${type}, ${K}, ${expiryDate.toISOString()}, 0.3)
+                    ON CONFLICT (ticker) DO NOTHING
+                `;
+            }
+        }
     }
 }
 
